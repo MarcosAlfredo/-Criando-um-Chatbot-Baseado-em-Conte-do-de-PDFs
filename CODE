@@ -1,0 +1,234 @@
+import os
+import PyPDF2
+import openai
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+from rich.console import Console
+from rich.prompt import Prompt
+from rich.panel import Panel
+
+# ============================================================
+# Configurações para o Azure OpenAI – substitua com seus dados
+openai.api_type = "azure"
+openai.api_base = "https://<SEU_RECURSO_AZURE_OPENAI>.openai.azure.com/"
+openai.api_version = "2023-03-15-preview"
+openai.api_key = "SUA_CHAVE_AZURE_OPENAI"
+
+# Definições dos engines a serem utilizados
+EMBEDDING_ENGINE = "text-embedding-ada-002"  # Engine para extração de embeddings
+CHAT_ENGINE = "gpt-35-turbo"  # Engine para o Chat (ChatCompletion)
+
+# Inicializa o console Rich para uma interface aprimorada
+console = Console()
+
+# ============================================================
+# Funções de processamento de PDF e criação do índice vetorial
+
+def extract_text_from_pdf(pdf_path: str) -> str:
+    """
+    Extrai o texto de um arquivo PDF usando a biblioteca PyPDF2.
+    
+    Args:
+        pdf_path (str): Caminho do arquivo PDF.
+    
+    Returns:
+        str: Texto extraído ou string vazia em caso de erro.
+    """
+    text = ""
+    try:
+        with open(pdf_path, "rb") as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+    except Exception as e:
+        console.print(f"[red]Erro ao ler {pdf_path}: {e}[/red]")
+    return text.strip()
+
+def load_pdfs_from_directory(directory: str) -> dict:
+    """
+    Carrega todos os PDFs de um diretório e extrai o texto de cada um.
+
+    Args:
+        directory (str): Caminho do diretório.
+
+    Returns:
+        dict: Dicionário com nomes de arquivos como chaves e textos extraídos como valores.
+    """
+    pdf_texts = {}
+    if not os.path.exists(directory):
+        console.print(f"[red]Diretório '{directory}' não existe.[/red]")
+        return pdf_texts
+
+    for filename in os.listdir(directory):
+        if filename.lower().endswith(".pdf"):
+            file_path = os.path.join(directory, filename)
+            text = extract_text_from_pdf(file_path)
+            if text:
+                pdf_texts[filename] = text
+    return pdf_texts
+
+def get_embedding(text: str, engine: str = EMBEDDING_ENGINE):
+    """
+    Obtém o embedding de um texto utilizando a API do Azure OpenAI para embeddings.
+
+    Args:
+        text (str): Texto a ser transformado em embedding.
+        engine (str): Nome do engine utilizado para gerar o embedding.
+
+    Returns:
+        np.array: Vetor de embedding ou None em caso de erro.
+    """
+    try:
+        response = openai.Embedding.create(
+            engine=engine,
+            input=text,
+        )
+        embedding = response['data'][0]['embedding']
+        return np.array(embedding)
+    except Exception as e:
+        console.print(f"[red]Erro ao obter embedding: {e}[/red]")
+        return None
+
+def build_vector_index(pdf_texts: dict) -> list:
+    """
+    Cria um índice vetorial dos textos extraídos dos PDFs.
+    
+    Args:
+        pdf_texts (dict): Dicionário com textos extraídos dos PDFs.
+    
+    Returns:
+        list: Lista de dicionários contendo o identificador do documento, o texto e o embedding.
+    """
+    vector_index = []
+    for doc_id, text in pdf_texts.items():
+        embedding = get_embedding(text)
+        if embedding is not None:
+            vector_index.append({
+                "doc_id": doc_id,
+                "text": text,
+                "embedding": embedding
+            })
+        else:
+            console.print(f"[red]Embedding não gerado para: {doc_id}[/red]")
+    return vector_index
+
+def search_query(query: str, vector_index: list, top_k: int = 3) -> list:
+    """
+    Realiza a busca vetorial comparando o embedding da consulta com os embeddings indexados.
+
+    Args:
+        query (str): Consulta do usuário.
+        vector_index (list): Índice vetorial dos documentos.
+        top_k (int): Número de documentos mais relevantes a retornar.
+
+    Returns:
+        list: Lista dos top_k documentos mais relevantes.
+    """
+    query_embedding = get_embedding(query)
+    if query_embedding is None:
+        return []
+
+    results = []
+    for item in vector_index:
+        score = cosine_similarity(query_embedding.reshape(1, -1), item["embedding"].reshape(1, -1))[0][0]
+        results.append({**item, "score": score})
+    
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+# ============================================================
+# Funções para interação e geração de respostas com o Chatbot
+
+def generate_answer(query: str, context_text: str, engine: str = CHAT_ENGINE) -> str:
+    """
+    Gera uma resposta para a consulta do usuário com base no contexto extraído dos PDFs.
+
+    Args:
+        query (str): Consulta do usuário.
+        context_text (str): Texto de contexto extraído dos documentos.
+        engine (str): Nome do engine utilizado para geração de respostas.
+
+    Returns:
+        str: Resposta gerada pelo modelo.
+    """
+    prompt = f"Contexto:\n{context_text}\n\nPergunta: {query}\nResposta:"
+    try:
+        response = openai.ChatCompletion.create(
+            engine=engine,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Você é um assistente útil e preciso que responde perguntas baseadas em contextos extraídos de documentos PDF."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2,
+            max_tokens=200,
+        )
+        answer = response["choices"][0]["message"]["content"].strip()
+        return answer
+    except Exception as e:
+        console.print(f"[red]Erro ao gerar resposta: {e}[/red]")
+        return "Desculpe, ocorreu um erro ao gerar a resposta."
+
+def display_banner():
+    """
+    Exibe um banner de boas-vindas utilizando a formatação Rich.
+    """
+    banner = Panel.fit(
+        "[bold cyan]Chatbot de Conteúdo PDF[/bold cyan]\n"
+        "Integre IA generativa com busca vetorial para navegar seus documentos!",
+        title="Bem-vindo",
+        subtitle="Digite 'sair' para encerrar",
+        padding=(1, 2)
+    )
+    console.print(banner)
+
+def run_chatbot(vector_index: list):
+    """
+    Executa o loop interativo do chatbot.
+    
+    Args:
+        vector_index (list): Índice vetorial dos documentos.
+    """
+    console.print("[green]O chatbot está pronto para receber suas perguntas![/green]")
+    while True:
+        query = Prompt.ask("\n[bold yellow]Pergunta[/bold yellow]")
+        if query.strip().lower() in ["sair", "exit"]:
+            console.print("[bold red]Encerrando o chatbot. Até logo![/bold red]")
+            break
+
+        results = search_query(query, vector_index, top_k=3)
+        if results:
+            context = "\n\n".join(
+                [f"[bold]Documento:[/bold] {res['doc_id']}\n[italic]{res['text'][:500]}...[/italic]"
+                 for res in results]
+            )
+        else:
+            context = "Contexto não encontrado nos documentos."
+
+        answer = generate_answer(query, context)
+        console.print(Panel.fit(answer, title="Resposta", style="green"))
+
+# ============================================================
+# Função principal de orquestração
+
+def main():
+    display_banner()
+
+    pdf_directory = "inputs"  # Pasta dos PDFs
+    console.print("[green]Carregando documentos PDF...[/green]")
+    pdf_texts = load_pdfs_from_directory(pdf_directory)
+    if not pdf_texts:
+        console.print("[red]Nenhum PDF encontrado na pasta 'inputs'. Adicione arquivos PDF e tente novamente.[/red]")
+        return
+
+    console.print("[green]Construindo índice vetorial dos documentos...[/green]")
+    vector_index = build_vector_index(pdf_texts)
+
+    run_chatbot(vector_index)
+
+if __name__ == "__main__":
+    main()
